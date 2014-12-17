@@ -1,0 +1,282 @@
+---
+title: "PML Assignment Write-up"
+author: "Zahari Zankov"
+date: "11/22/2014"
+output: html_document
+---
+```{r global_options, results='hide',echo=FALSE}
+library(knitr)
+if (getwd() != "/home/hari/Practical Machine Learning/PML-Assignment") setwd("./Practical Machine Learning/PML-Assignment/")
+opts_chunk$set(cache=T)
+opts_chunk$set(warning=F)
+```
+# The Data
+## Loading data and packages
+Packages **caret** and **AppliedPredictiveModeling** are imported for the modeling purposes of the assignment. An additional package - **doMC** is also included here to enable parallel computation and reduce the model fitting time. Package **rattle** is imported just for a better demonstration of one of the model fits.
+```{r libs_and_raw_data}
+library(caret)
+library(AppliedPredictiveModeling)
+library(doMC)
+library(rattle)
+registerDoMC(cores=8)
+data <- read.csv("pml-training.csv", stringsAsFactors = F)
+testing <- read.csv("pml-testing.csv", stringsAsFactors = F)
+set.seed(1986)
+data <- data[sample(nrow(data),replace = F),]
+```
+The last command is more a personal choice than a necessity. Since the data is ordered, e.g. observations X = 1 through 5580 are all class A, I find this as extra reassurance that the observations will be randomized. Keep in mind that a similar randomization this is also done with the ***createDataPartition()*** function from the **caret** package later on. 
+
+## Creating training, cross-validation and testing subsets
+We purposefully discard covariate **X** from the dataset. As mentioned above its correlation with the response variable is 1 but in reality has no explanatory power. We can fit a very simple model that has no variance but also no predictive power. 
+```{r X_fit_demo}
+X.fit <- train(I(as.factor(classe)) ~ X, data = data, method = 'rpart', tuneGrid = expand.grid(cp = 0))
+fancyRpartPlot(X.fit$finalModel)
+confusionMatrix(predict(X.fit,data),data$classe)
+```
+
+Additionally the classes are relatively evenly distributed with `r round(table(data$classe)/length(data$classe),4)*100` representing percentage of the data having labels respectively A, B, C, D and E. This has implications with regards to the choice of metric to optimize in the model fitting. More specifically it would appear that using **accuracy** as an optimization objective would be sensible.
+Below we separate the raw data into a traning set and a cross-validation set in order to be able to estimate the out-of-sample error on the trained model(s). Having a rather large data set for training purposes we choose to follow the 60-40 rule of thumb.
+```{r splitting_data}
+# set training indexes
+inTrain <- createDataPartition(data$classe,p = 0.6, list = F)
+
+# remove covariate 'X' and split data into training and cross-validation sets 
+training <- data[inTrain, 2:dim(data)[2]]
+cv <- data[-inTrain, 2:dim(data)[2]]
+testing <- testing[,-1]
+
+# free up memory
+rm(data,inTrain)
+
+# Set outcome to factor variable
+training$classe <- as.factor(training$classe)
+cv$classe <- as.factor(cv$classe)
+training$user_name <- as.factor(training$user_name)
+cv$user_name <- as.factor(cv$user_name)
+testing$user_name <- as.factor(testing$user_name)
+```
+
+## Subsetting covariates
+Exploring the covariates we discover  certain variables have substantial amounts of missing data. These turn out to be all of the summary variables, e.g. min / max of some other variable already in the dataset. These are excluded from the model fitting procedures.
+Very low variance variables are also exluded using the ***nzv()*** function from the **caret** package. 
+Here we also loop through the columns and ensure the variables are the appropriate format.
+```{r subsetting_covariates}
+# remove near zero variance variables
+nzVars <- nearZeroVar(training)
+training <- training[,-nzVars]
+cv <- cv[,-nzVars]
+testing <- testing[,-nzVars]
+
+# removing variables which have sparce data with a lot of NA values
+# number of variables which have NA values
+length(apply(is.na(training),2,sum)[apply(is.na(training),2,sum)>0])
+# number of NA values for each column
+unique(apply(is.na(training),2,sum)[apply(is.na(training),2,sum)>0])
+# names of the variables which have NA values
+names(apply(is.na(training),2,sum)[apply(is.na(training),2,sum)>0])
+subsVect <- as.vector(apply(is.na(training),2,sum)==0)
+training <- training[,subsVect]
+cv <- cv[,subsVect]
+testing <- testing[,subsVect]
+
+# Nothing left to impute
+sum(is.na(training),is.na(cv),is.na(testing))
+
+# make data the appropriate format
+for (i in 1:(dim(training)[2]-1)) {
+  if (names(training)[i]=='cvtd_timestamp') {
+    training$cvtd_timestamp <- as.Date(training$cvtd_timestamp)
+    cv$cvtd_timestamp <- as.Date(cv$cvtd_timestamp)
+    testing$cvtd_timestamp <- as.Date(testing$cvtd_timestamp)
+  } else if (names(training)[i]!='user_name') {
+    training[,i] <- as.numeric(training[,i])
+    cv[,i] <- as.numeric(cv[,i])
+    testing[,i] <- as.numeric(testing[,i])
+  }
+}
+```
+
+Below we explore correlated variables. These are in the analysis mainly for descriptive purposes although at one point they were used to subset the data further however the model fitted using it didn't turn out to be the one with the highest predictive power. The **highlyCorVar** below represents the subset of variables to be excluded from the analysis as a result of the ***findCorrelation()*** function from **caret**. We also try to find variables which are linear combinations of other variables in the training data but find none.
+```{r high_cor_and_linear_combos}
+# Removing correlated variables
+varCor <- cor(training[,-c(1,4,58)])
+summary(varCor[upper.tri(varCor)])
+highlyCorVar <- findCorrelation(varCor,cutoff = 0.9)
+names(training)[highlyCorVar]
+
+# Looking for linear combinations
+comboInfo <- findLinearCombos(training[,-c(1,4,58)])
+comboInfo
+```
+## Exploring the data
+As it can be seen on in the plot below the relationship between the predictors and the response variable is not obvious and is most probably not linear. Not all varialbes are presented in the plot however with 57 remaining predictors and 1 response variable the pairs plot becomes exessively busy and unreadable. 
+```{r feature_plots, fig.width=11, fig.height=10}
+set.seed(9453168)
+transparentTheme(trans=0.4)
+featurePlot(x = training[,sample(1:(ncol(training)-1),6)],y = training$classe,
+            plot='pairs',
+            cex = 0.5,
+            autokey = list(columns=6))
+```
+As an initial observation we would expect linear models and less flexible models to perform poorly on the data. Thus we would look to tune the parameters wherever possible for more flexibility. 
+Considering the high dimentionality of the data the knn models is expected to be very sensitive to the training data. The following chapters discuss a number of model fits applied to the training data and their respective performance.
+
+# Model Fitting
+A number of models were fitted to the data in order to find the best approximation to the true function which gives us the **classe** response and then to optimize it. Before we move on the the winners we discuss a few failed attempts as well as a few bad fits to the data.
+
+## Unsuccessful models
+Due to the large size of the dataset as well as the high number of covariates a few models proved to be computationally infeasable to fit (at least for the set up used for this piece of research: 8GB DDR3 RAM; Quad-Core Intel Core i7-3630QM 6MB-cache running on Linux Mint 16. In this list we have put classification tree **(ctree)**, bagging with trees **(treebag)** and boosting with trees **(gbm)**. Although it may be possible to fit the models they currently fill up the entire RAM and SWAP partition of the system and crash the machine. 
+
+Support Vector Machines with Polynomial and Radial kernel are also in the list of unsuccessful model fits. Although these do not crash the machine fitting the models was excessively time consuming. In the interest of full disclosure 3.5 hours were not enough to fit the SVM with Polynomial Kernel for example.
+
+## Poor accuracy models
+As mentioned earlier the data spans in many dimentions and does not seem like it can be separated linearly very well. We thus expect a Linear Discriminant Analysis to perform rather poorly and this is in fact the result we get. 
+```{r lda_fit}
+set.seed(414112)
+lda.fit <- train(classe ~ ., data = training, method = 'lda2',tuneGrid = expand.grid(dimen = 1:25))
+cv.performance <- confusionMatrix(predict(lda.fit,cv),cv$classe)
+cv.performance
+```
+Note that although an accuracy of `r round(lda.fit$results[rownames(lda.fit$bestTune),2],4)*100`% on the training set and `r round(cv.performance$overall["Accuracy"],4)*100`% on the cross-validation set may not look excessively bad compared to a random guess we can fit models with much better accuracy. Furthermore notice the relatively poor Sensitivity metrics. 
+
+In order to give this method another chance it was attempted to apply preprocessing to the data with the hope to improve the performance of the model however it proved to but a negligible improvement. 
+```{r lda_fit_preprocess}
+lda.fit.prep <- train(classe ~ ., data = training, method = 'lda2',tuneGrid = expand.grid(dimen = 1:25), preProcess = c('center','scale'))
+lda.fit.prep$result[rownames(lda.fit.prep$bestTune),2]
+confusionMatrix(predict(lda.fit,cv),cv$classe)
+```
+Although we have not explored it here, because of its similarity to LDA, the SVM with Linear Kernel is expected to perform rather poorly on the data set.
+In the following section we fit a Quadratic Discriminant Analysis as we expect for the non-linearity it introduces to be beneficial.
+
+## The Good Performers
+### Quadratic Discriminant Analysis
+A few models were found to perform very well. In order to continue from the previous point we start with the Quadratic Discriminant Analysis model. An important specific of this model fit is that it wouldn't run initially. We believe that the reason for this is the presence of highly correlated predictors in the data set. We exclude these to make the model fit possible.
+```{r qda_model}
+qda.fit <- train(classe ~ ., data = training[,-highlyCorVar], method = 'qda')
+qda.fit$results[2]
+confusionMatrix(predict(qda.fit,cv),cv$classe)
+```
+
+Although this is clearly a huge improvement over the LDA model there is much more to explore in this dataset. To begin with discarding the highly correlated variables may not be the best thing to do in the setting of the problem. The readings come from different detectors so even though they may be correlated they are measuring a different dimention in the 3D space. It may well be the case that by nature the particular exercise being performed exhibits these correlated features. 
+
+### Logistic Regression
+In the interest of full disclosure the **glm** model cannot be fit using the ***train()*** function of the **caret** as it returns the following error
+
+```{r glm_error, error=TRUE}
+train(classe ~ ., data = training, method = 'glm')
+```
+
+We can however see that the logistic regression in fact fits the data very well. The way we reach this conclusion is by fitting a model for each class and estimating the training error.
+
+```{r glm_train_fit}
+glm.fitA <- glm(I(classe=='A') ~ ., data = training, family = binomial)
+glm.fitB <- glm(I(classe=='B') ~ ., data = training, family = binomial)
+glm.fitC <- glm(I(classe=='C') ~ ., data = training, family = binomial)
+glm.fitD <- glm(I(classe=='D') ~ ., data = training, family = binomial)
+glm.fitE <- glm(I(classe=='E') ~ ., data = training, family = binomial)
+prob.df.train <- data.frame(A = predict(glm.fitA,type = 'response'),
+                            B = predict(glm.fitB,type = 'response'),
+                            C = predict(glm.fitC,type = 'response'),
+                            D = predict(glm.fitD,type = 'response'),
+                            E = predict(glm.fitE,type = 'response'))
+pred.df.train <- as.factor(apply(prob.df.train,1,function(x) names(prob.df.train)[which(x==max(x))]))
+train.accuracy <- mean(pred.df.train == training$classe)
+train.accuracy
+table(pred.df.train, training$classe)
+```
+Although the accuracy is high, there probably is a good reason why the logistic regression model could not be fit to the data set directly from the **caret** package function. Thus we will not proceed to explore this particular model. On the other hand, with a training error slightly higher than the QDA model we are optimistic about the performance of models which derive from the logit family.
+
+### Logit Boost 
+We proceed to fit a **LogitBoost** model which indeed proves fruitful. One caveat of boosting models is that they learn slower. This however comes with the benefit of more robustness and higher accuracy. The model below proves to be one our best so far with a very high accuracy on both the training and the cross-validation sets. A big drawback of this model however is that some of the predicted values are actually **NAs** because for some observations the model predicts that it is equally likely that it falls in more than one class.
+```{r logitboost_fit}
+LogitBoost.fit <- train(classe ~ ., data = training,
+                       method = 'LogitBoost',
+                       tuneGrid = expand.grid(nIter = seq(10,100,by = 10)))
+LogitBoost.fit$results[rownames(LogitBoost.fit$bestTune),2]
+cv.performance <- confusionMatrix(predict(LogitBoost.fit,cv),cv$classe)
+cv.performance
+sum(is.na(predict(LogitBoost.fit,cv)))
+
+# Plot the training accuracy
+trellis.par.set(caretTheme())
+plot(LogitBoost.fit)
+```
+
+When training the model we specify the tuning parameter ***nInter*** (i.e. number of iterations) to an array of 10 to 100 incremented by 10. Plotting the training accuracy of the model we can see that it is improved (although with a decreasing rate) with higher numbers of iterations. The model automatically picks the best fit to the data, i.e. 100 nIter and although we cannot directly test the out-of-sample accuracy for each of the fitted models the performance of the final model is more than satisfactory.  
+### K-Nearest Neighbours
+Generally we were skeptical when fitting this model because of the high dimentionallity curse that the **knn** model suffers from. As an experiment however this model was fit (with preProcess parameters as this improves performance greatly for this class of models) and proved to perform great. We could not stress more the importance of scaling the data.
+
+```{r knn_fit}
+knn.fit <- train(classe ~ ., data = training,
+                 method = 'kknn',
+                 preProcess = c('center','scale'),
+                 tuneGrid <- expand.grid(kmax = c(1,3,5,7),distance = 2, kernel = 'optimal'))
+knn.fit$results[rownames(knn.fit$bestTune),'Accuracy']
+confusionMatrix(predict(knn.fit,cv),cv$classe)
+
+#Plot the knn model accuracy against k
+trellis.par.set(caretTheme())
+plot(knn.fit)
+```
+
+The accuracy of the model is flat with regards to the number of maximum k.
+
+### Classification and regression trees (CART)
+The **rpart** method in **caret** allows us to fit this model. This model has the benefit of being very quick to train and at the same time highly accurate. Unfortunately because of the complexity of the best model (with complexity parameter set to 0) is so high that it is unviable to visualize it although it is in theory interpretable. This may potentially prove to be a problem of overfitting the training data however with a cross-validation error that low we are confident that this is currently not a problem.
+
+```{r rpart_fit}
+rpart.fit <- train(classe ~ ., data = training,
+                  method = 'rpart',tuneGrid = expand.grid(cp=seq(0,1,by=0.1)))
+rpart.fit$results[rownames(rpart.fit$bestTune),2]
+confusionMatrix(predict(rpart.fit,cv),cv$classe)
+
+# plot the rpart model accuracy
+trellis.par.set(caretTheme())
+plot(rpart.fit)
+```
+
+It becomes apparent that with higher values of the tuning parameter the performance of the model worsens. The complexity on the other hand decreases and the model becomes easy to plot and interpret. 
+
+### Random Forests
+This model should provide a significant improvement over the CART model which is already a good fit. The benefit of using this model is that it fits large number of models using only a subset of the covariates and then averages the models to reach a 'consensus' model. We are strong supporters of this model because eventhough it is not easy to interpret the averaging of different 'opinions' proves to improve accuracy dramatically in non-linear settings like this provided there is a prenty of training data. The random forests fit proves to fit the training data perfectly and eventhough this is a red light for the possibility of overfitting the model also performs almost flawlessly on the cross-validation set.
+```{r rf_fit}
+rf.fit <- train(classe ~ ., data = training,
+               method = 'rf',
+               tuneGrid = expand.grid(mtry = c(2,10,20,30,40,50,60)))
+rf.fit$results[rownames(rf.fit$bestTune),2]
+cv.performance <- confusionMatrix(predict(rf.fit,cv),cv$classe)
+cv.performance
+# plot the rpart model accuracy
+trellis.par.set(caretTheme())
+plot(rf.fit)
+```
+
+As depicted on the plot the model is optimized at a 20 randomly selected predictors ***(mtry)***. Increasing the number of random predictors beyond that comes at a cost (initially small but then increases). It is important to note that this model would depend somewhat on the inital seed. Considering how close the performances of mtry = 20 and mtry = 30 are currently we may well consider them equivalent.  
+
+## The Winner
+The winner among the good fits is clearly the Random Forests model. After applying the model to the cross-validation set we expect the **out-of-sample error** (1 - Accuracy) to be **`r round((1-cv.performance$overall['Accuracy']),4)*100`%** with a **95% confidence interval** of **`r round((1 - cv.performance$overall['AccuracyUpper']),4)*100`%** to **`r round((1 - cv.performance$overall['AccuracyLower']),4)*100`%**. This model is also characterized with very good metrics for Sencitivity, Specificity, Positive Predicted Value and Negative Predicted Value. 
+
+# Conclusion and test set predictions
+In this piece of research a number of models were explored and fit to the data. It quickly becomes apparent how much computational power is needed in data analysis in general. Eventhough there are a number of models which appear to fit the data well some of them have issues associated with them. As we saw earlier the LogitBoost model gives an <NA> prediction for a number of observations. The KNN fit on the other hand is infamous for being very sensitive to the training data subset used to fit the model even after scaling the data because of the large number of covariates. The Quadratic Discriminant Analysis as well as the CART model prove to be of great value with regards to the time-to-train - accuracy trade-off. The Random Forests however proves to be superior in accuracy to all of the aforementioned. Following are our predicions.
+
+```{r test_predictions}
+predict(rf.fit, testing)
+```
+
+Just for comparison purposes we compile a data frame of all predictions and out-of-sample accuracy in order of all good fit models.
+
+```{r aggregate_prediction}
+combPred <- rbind(c(confusionMatrix(predict(rf.fit,cv),cv$classe)$overall['Accuracy'], predict(rf.fit,testing)),
+                  c(confusionMatrix(predict(LogitBoost.fit,cv),cv$classe)$overall['Accuracy'], predict(LogitBoost.fit,testing)),
+                  c(confusionMatrix(predict(knn.fit,cv),cv$classe)$overall['Accuracy'], predict(knn.fit,testing)),
+                  c(confusionMatrix(predict(rpart.fit,cv),cv$classe)$overall['Accuracy'], predict(rpart.fit,testing)), 
+                  c(confusionMatrix(predict(qda.fit,cv),cv$classe)$overall['Accuracy'], predict(qda.fit,testing)))
+rownames(combPred) <- c("RF","LogitBoost","KNN", "CART", "QDA")
+colnames(combPred) <- c("OOS Error",1:20)
+combPred <- as.data.frame(combPred)
+combPred[,-1] <- t(apply(combPred[,-1],1,factor,levels = 1:5, labels=c('A','B','C','D','E')))
+combPred
+apply(combPred[,-1],2,function(x) x[order(x)][ceiling(length(x))])
+```
+Overall the models' predictions are in agreement with the exception of test observations 3 and 8 where models KNN and LogitBoost respectively predict differently than the mode. Considering the superior performance of the random forests model we decide to not bias the predictions and simply use the models predictions for our final response for the test data set. 
+As we discovered later submitting the 20 predictions for the response variable of the test set on the course website we yield 100% accuracy which further reassures us of the goodness of the model fit. 
